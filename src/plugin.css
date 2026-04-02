@@ -1,0 +1,148 @@
+.report-logger {
+  font-family: "Segoe UI", Tahoma, sans-serif;
+  color: #172a3a;
+  background: linear-gradient(140deg, #f8fcff 0%, #eef6fb 100%);
+  min-height: 100%;
+  padding: 16px;
+}
+
+.report-logger * {
+  box-sizing: border-box;
+}
+
+.rl-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  gap: 12px;
+}
+
+.rl-title {
+  margin: 0;
+  font-size: 20px;
+}
+
+.rl-pill {
+  border-radius: 999px;
+  padding: 4px 10px;
+  background: #dbeaf5;
+  font-size: 12px;
+}
+
+.rl-grid {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 14px;
+}
+
+.rl-panel {
+  background: #ffffff;
+  border: 1px solid #d9e3ec;
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: 0 6px 20px rgba(31, 58, 85, 0.08);
+}
+
+.rl-section-title {
+  margin: 0 0 10px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.rl-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rl-item {
+  border: 1px solid #d3deea;
+  border-radius: 8px;
+  background: #f8fbff;
+  padding: 8px;
+  cursor: pointer;
+}
+
+.rl-item[data-active='true'] {
+  border-color: #2e6da8;
+  background: #e6f0f8;
+}
+
+.rl-meta {
+  color: #5f7388;
+  font-size: 12px;
+}
+
+.rl-form-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.rl-input,
+.rl-select,
+.rl-textarea {
+  width: 100%;
+  border: 1px solid #c5d4e3;
+  border-radius: 8px;
+  padding: 8px;
+  background: #ffffff;
+}
+
+.rl-textarea {
+  min-height: 260px;
+  resize: vertical;
+  font-family: Consolas, "Courier New", monospace;
+}
+
+.rl-button {
+  border: 1px solid #2f6fa8;
+  background: #2f6fa8;
+  color: #ffffff;
+  border-radius: 8px;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+
+.rl-button.secondary {
+  border-color: #c3d2e0;
+  background: #eef4f9;
+  color: #183047;
+}
+
+.rl-button.danger {
+  border-color: #b24141;
+  background: #d74f4f;
+}
+
+.rl-badge {
+  border-radius: 6px;
+  background: #edf5fb;
+  padding: 2px 6px;
+  font-size: 11px;
+}
+
+.rl-warning {
+  border: 1px solid #e6c47f;
+  background: #fff9ef;
+  color: #6f4b00;
+  border-radius: 8px;
+  padding: 8px;
+  margin-bottom: 8px;
+}
+
+.rl-footer {
+  margin-top: 10px;
+  display: flex;
+  justify-content: space-between;
+  color: #5a7188;
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .rl-grid {
+    grid-template-columns: 1fr;
+  }
+}

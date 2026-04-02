@@ -1,0 +1,1092 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
+import type { DataEnvelope, IAppContext, IPlugin } from '@toolbox/sdk'
+import { builtInTemplates, defaultPayload } from './defaults'
+import './plugin.css'
+import {
+  CASE_REPORT_LINK_CREATED,
+  CASE_REPORT_TEMPLATE_IMPORTED,
+  CASE_REPORT_UPDATED,
+  DATA_VERSION,
+  PLUGIN_ID,
+  STORAGE_KEY,
+  TASKBOARD_TASK_SELECTED,
+  TASKBOARD_TASK_UPDATED,
+  TASK_COUNT_CHANGED,
+  linkCreatedEventSchema,
+  payloadSchema,
+  reportSchema,
+  reportUpdatedEventSchema,
+  taskReportLinkSchema,
+  taskSelectedEventSchema,
+  taskSnapshotSchema,
+  taskUpdatedEventSchema,
+  templateImportedEventSchema,
+  templateSchema,
+  type PayloadV1,
+  type Report,
+  type TaskReportLink,
+  type TaskSnapshot,
+  type Template,
+} from './schemas'
+import { formatDate, previewText, safeJsonParse, throttle, uid } from './utils'
+
+type IDataEnvelope<T> = DataEnvelope<T>
+
+type SaveSource = 'storage' | 'indexeddb-bridge'
+
+type IndexedDbBridge = {
+  get?: (namespace: string, key: string) => Promise<unknown>
+  save?: (namespace: string, key: string, data: unknown, version: string) => Promise<void>
+}
+
+type ConflictChoice = 'local' | 'external' | 'manual'
+
+type ConflictState = {
+  reportId: string
+  externalUpdatedAt: number
+  localUpdatedAt: number
+} | null
+
+const NAMESPACES = {
+  taskboardTasks: 'taskboard.tasks',
+  reports: 'caseLogger.reports',
+  links: 'caseLogger.taskReportLinks',
+  templates: 'caseLogger.templates',
+} as const
+
+const AUTHOR_FALLBACK = 'report-logger-user'
+
+const log = {
+  restoreStart: () => console.info('[plugin] restore start'),
+  restorePayload: (preview: string, extractedPath: string) =>
+    console.info('[plugin] restore payload', { preview, extractedPath }),
+  restoreSuccess: (count: number, source: string) =>
+    console.info('[plugin] restore success', { count, source }),
+  restoreFailed: (error: unknown) => console.error('[plugin] restore failed', { error }),
+  saveTriggered: (count: number) => console.info('[plugin] save triggered', { count }),
+  saveFailed: (error: unknown) => console.error('[plugin] save failed', { error }),
+  linkCreateStart: (taskId: string, reportId: string) =>
+    console.info('[report-logger] link create start', { taskId, reportId }),
+  linkCreateSuccess: (taskId: string, reportId: string) =>
+    console.info('[report-logger] link create success', { taskId, reportId }),
+  linkCreateFailed: (error: unknown) => console.error('[report-logger] link create failed', { error }),
+  templateImportStart: (name: string) =>
+    console.info('[report-logger] template import start', { name: previewText(name, 40) }),
+  templateImportSuccess: (templateId: string) =>
+    console.info('[report-logger] template import success', { templateId }),
+  templateImportFailed: (error: unknown) =>
+    console.error('[report-logger] template import failed', { error }),
+  taskSyncReceived: (taskId: string) => console.info('[report-logger] task sync received', { taskId }),
+  conflictDetected: (reportId: string) =>
+    console.warn('[report-logger] conflict detected', { reportId }),
+}
+
+function readBridge(context: IAppContext): IndexedDbBridge | null {
+  const candidate = (context.runtimeConfig as Record<string, unknown> | undefined)?.indexedDbBridge
+  if (!candidate || typeof candidate !== 'object') {
+    return null
+  }
+  return candidate as IndexedDbBridge
+}
+
+function normalizeUnknown(input: unknown): { value: unknown; extractedPath: string } {
+  let current = input
+  let path = 'root'
+
+  for (let i = 0; i < 6; i += 1) {
+    if (typeof current === 'string') {
+      const parsed = safeJsonParse(current)
+      if (parsed === null) {
+        break
+      }
+      current = parsed
+      path = `${path}.json`
+      continue
+    }
+    if (current && typeof current === 'object') {
+      const record = current as Record<string, unknown>
+      if ('data' in record) {
+        current = record.data
+        path = `${path}.data`
+        continue
+      }
+      if ('value' in record) {
+        current = record.value
+        path = `${path}.value`
+        continue
+      }
+      if ('payload' in record) {
+        current = record.payload
+        path = `${path}.payload`
+        continue
+      }
+      break
+    }
+    break
+  }
+
+  return { value: current, extractedPath: path }
+}
+
+function parseArrayCandidate(raw: unknown): unknown[] {
+  const normalized = normalizeUnknown(raw).value
+  if (Array.isArray(normalized)) {
+    return normalized
+  }
+  if (normalized && typeof normalized === 'object') {
+    const rec = normalized as Record<string, unknown>
+    if (Array.isArray(rec.tasks)) {
+      return rec.tasks
+    }
+  }
+  return []
+}
+
+function migrateToV1(raw: unknown): PayloadV1 {
+  const empty = defaultPayload()
+  const normalized = normalizeUnknown(raw)
+  log.restorePayload(previewText(normalized.value), normalized.extractedPath)
+
+  if (Array.isArray(normalized.value)) {
+    const maybeReports = normalized.value
+      .map((item) => reportSchema.safeParse(item))
+      .filter((item) => item.success)
+      .map((item) => item.data)
+    return {
+      ...empty,
+      reports: maybeReports,
+      migrationMeta: {
+        version: DATA_VERSION,
+        upgrades: [{ from: 'legacy-array', to: DATA_VERSION, at: Date.now() }],
+      },
+    }
+  }
+
+  if (!normalized.value || typeof normalized.value !== 'object') {
+    return empty
+  }
+
+  const rec = normalized.value as Record<string, unknown>
+  const reportsRaw = rec.reports ?? rec[NAMESPACES.reports] ?? rec.tasks
+  const linksRaw = rec.taskReportLinks ?? rec[NAMESPACES.links]
+  const templatesRaw = rec.templates ?? rec[NAMESPACES.templates]
+  const snapshotsRaw = rec.taskSnapshotCache ?? rec[NAMESPACES.taskboardTasks]
+
+  const reports = parseArrayCandidate(reportsRaw)
+    .map((item) => reportSchema.safeParse(item))
+    .filter((item) => item.success)
+    .map((item) => item.data)
+
+  const taskReportLinks = parseArrayCandidate(linksRaw)
+    .map((item) => taskReportLinkSchema.safeParse(item))
+    .filter((item) => item.success)
+    .map((item) => item.data)
+
+  const importedTemplates = parseArrayCandidate(templatesRaw)
+    .map((item) => templateSchema.safeParse(item))
+    .filter((item) => item.success)
+    .map((item) => item.data)
+
+  const taskSnapshotCache = parseArrayCandidate(snapshotsRaw)
+    .map((item) => taskSnapshotSchema.safeParse(item))
+    .filter((item) => item.success)
+    .map((item) => item.data)
+
+  const merged = {
+    ...empty,
+    ...rec,
+    reports,
+    taskReportLinks,
+    templates: importedTemplates.length > 0 ? importedTemplates : [...builtInTemplates],
+    taskSnapshotCache,
+    migrationMeta: {
+      version: DATA_VERSION,
+      upgrades: [
+        {
+          from: String((rec.migrationMeta as Record<string, unknown> | undefined)?.version ?? 'unknown'),
+          to: DATA_VERSION,
+          at: Date.now(),
+        },
+      ],
+    },
+  }
+
+  const parsed = payloadSchema.safeParse(merged)
+  return parsed.success ? parsed.data : empty
+}
+
+async function savePayload(context: IAppContext, payload: PayloadV1): Promise<SaveSource> {
+  const envelope: IDataEnvelope<PayloadV1> = {
+    pluginId: PLUGIN_ID,
+    version: DATA_VERSION,
+    timestamp: Date.now(),
+    type: 'PERSIST',
+    payload,
+  }
+
+  await context.storage.save(STORAGE_KEY, envelope, DATA_VERSION)
+
+  const bridge = readBridge(context)
+  if (bridge?.save) {
+    await Promise.all([
+      bridge.save(NAMESPACES.reports, STORAGE_KEY, payload.reports, DATA_VERSION),
+      bridge.save(NAMESPACES.links, STORAGE_KEY, payload.taskReportLinks, DATA_VERSION),
+      bridge.save(NAMESPACES.templates, STORAGE_KEY, payload.templates, DATA_VERSION),
+    ])
+    return 'indexeddb-bridge'
+  }
+
+  return 'storage'
+}
+
+async function restorePayload(context: IAppContext): Promise<{ payload: PayloadV1; source: SaveSource }> {
+  log.restoreStart()
+  const raw = await context.storage.get<unknown>(STORAGE_KEY)
+  const payload = migrateToV1(raw)
+
+  const bridge = readBridge(context)
+  if (bridge?.get) {
+    try {
+      const taskSnapshotRaw = await bridge.get(NAMESPACES.taskboardTasks, STORAGE_KEY)
+      const taskSnapshotCache = parseArrayCandidate(taskSnapshotRaw)
+        .map((item) => taskSnapshotSchema.safeParse(item))
+        .filter((item) => item.success)
+        .map((item) => item.data)
+      payload.taskSnapshotCache = taskSnapshotCache
+      payload.syncMeta.lastSyncAt = Date.now()
+      payload.syncMeta.sourcePlugin = 'taskboard'
+      return { payload, source: 'indexeddb-bridge' }
+    } catch (error) {
+      payload.syncMeta.lastError = String(error)
+    }
+  }
+
+  return { payload, source: 'storage' }
+}
+
+function parseTemplateFromFile(content: string): Template[] {
+  const normalized = normalizeUnknown(content).value
+  if (Array.isArray(normalized)) {
+    return normalized
+      .map((item) => templateSchema.safeParse(item))
+      .filter((item) => item.success)
+      .map((item) => item.data)
+  }
+  if (normalized && typeof normalized === 'object') {
+    const parsed = templateSchema.safeParse(normalized)
+    if (parsed.success) {
+      return [parsed.data]
+    }
+  }
+  return []
+}
+
+function resolveTemplate(
+  templateContent: string,
+  task: TaskSnapshot | null,
+  author: string,
+): { text: string; unresolved: string[] } {
+  const map: Record<string, string> = {
+    '{{task.title}}': task?.title ?? '',
+    '{{task.id}}': task?.id ?? '',
+    '{{today}}': new Date().toISOString().slice(0, 10),
+    '{{author}}': author,
+  }
+  let text = templateContent
+  for (const [key, val] of Object.entries(map)) {
+    text = text.split(key).join(val)
+  }
+
+  const unresolved = Array.from(text.matchAll(/{{[^}]+}}/g)).map((item) => item[0])
+  return { text, unresolved }
+}
+
+function ReportLoggerApp({ context }: { context: IAppContext }) {
+  const [reports, setReports] = useState<Report[]>([])
+  const [links, setLinks] = useState<TaskReportLink[]>([])
+  const [templates, setTemplates] = useState<Template[]>([])
+  const [taskSnapshotCache, setTaskSnapshotCache] = useState<TaskSnapshot[]>([])
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
+  const [selectedReportId, setSelectedReportId] = useState<string | null>(null)
+  const [hydrated, setHydrated] = useState(false)
+  const [syncSource, setSyncSource] = useState<SaveSource>('storage')
+  const [templatePaste, setTemplatePaste] = useState('')
+  const [templateName, setTemplateName] = useState('Pasted Template')
+  const [templateCategory, setTemplateCategory] = useState('general')
+  const [editorValue, setEditorValue] = useState('')
+  const [editorDirty, setEditorDirty] = useState(false)
+  const [lastSaveError, setLastSaveError] = useState('')
+  const [unresolvedPlaceholders, setUnresolvedPlaceholders] = useState<string[]>([])
+  const [conflict, setConflict] = useState<ConflictState>(null)
+
+  const firstPersistRef = useRef(true)
+  const conflictChoiceRef = useRef<ConflictChoice>('manual')
+
+  const selectedTask = useMemo(
+    () => taskSnapshotCache.find((task) => task.id === selectedTaskId) ?? null,
+    [taskSnapshotCache, selectedTaskId],
+  )
+
+  const selectedReport = useMemo(
+    () => reports.find((report) => report.id === selectedReportId) ?? null,
+    [reports, selectedReportId],
+  )
+
+  const throttledDraftSave = useMemo(
+    () =>
+      throttle((nextContent: string, reportId: string) => {
+        setReports((prev) =>
+          prev.map((report) => {
+            if (report.id !== reportId) {
+              return report
+            }
+            const updatedAt = Date.now()
+            return {
+              ...report,
+              content: nextContent,
+              updatedAt,
+              timeline: [
+                ...report.timeline,
+                {
+                  id: uid('tl'),
+                  type: 'updated',
+                  message: 'Autosave',
+                  at: updatedAt,
+                  by: AUTHOR_FALLBACK,
+                },
+              ],
+            }
+          }),
+        )
+        setEditorDirty(false)
+      }, 900),
+    [],
+  )
+
+  useEffect(() => {
+    let alive = true
+    const restore = async () => {
+      try {
+        const restored = await restorePayload(context)
+        if (!alive) {
+          return
+        }
+        const parsed = payloadSchema.safeParse(restored.payload)
+        const safePayload = parsed.success ? parsed.data : defaultPayload()
+
+        setReports(safePayload.reports)
+        setLinks(safePayload.taskReportLinks)
+        setTemplates(safePayload.templates)
+        setTaskSnapshotCache(safePayload.taskSnapshotCache)
+        setSyncSource(restored.source)
+
+        if (safePayload.reports.length > 0) {
+          setSelectedReportId(safePayload.reports[0].id)
+          setEditorValue(safePayload.reports[0].content)
+        }
+
+        log.restoreSuccess(safePayload.reports.length + safePayload.taskReportLinks.length, restored.source)
+      } catch (error) {
+        log.restoreFailed(error)
+      } finally {
+        if (alive) {
+          setHydrated(true)
+        }
+      }
+    }
+
+    restore()
+
+    return () => {
+      alive = false
+    }
+  }, [context])
+
+  useEffect(() => {
+    if (!selectedReport) {
+      setEditorValue('')
+      return
+    }
+    setEditorValue(selectedReport.content)
+    setEditorDirty(false)
+  }, [selectedReport])
+
+  useEffect(() => {
+    if (!hydrated) {
+      return
+    }
+    if (firstPersistRef.current) {
+      firstPersistRef.current = false
+      return
+    }
+
+    const payload: PayloadV1 = {
+      version: DATA_VERSION,
+      taskReportLinks: links,
+      reports,
+      templates,
+      taskSnapshotCache,
+      editorDraft: {
+        reportId: selectedReportId,
+        content: editorValue,
+        autosavePending: editorDirty,
+        updatedAt: Date.now(),
+      },
+      syncMeta: {
+        lastSyncAt: Date.now(),
+        sourcePlugin: syncSource,
+        lastError: lastSaveError,
+        retries: 0,
+      },
+      migrationMeta: {
+        version: DATA_VERSION,
+        upgrades: [],
+      },
+    }
+
+    log.saveTriggered(reports.length + links.length)
+    savePayload(context, payload).catch((error) => {
+      setLastSaveError(String(error))
+      log.saveFailed(error)
+    })
+  }, [
+    context,
+    editorDirty,
+    editorValue,
+    hydrated,
+    lastSaveError,
+    links,
+    reports,
+    selectedReportId,
+    syncSource,
+    taskSnapshotCache,
+    templates,
+  ])
+
+  useEffect(() => {
+    if (!hydrated || !selectedReportId) {
+      return
+    }
+    if (!editorDirty) {
+      return
+    }
+
+    throttledDraftSave(editorValue, selectedReportId)
+  }, [editorDirty, editorValue, hydrated, selectedReportId, throttledDraftSave])
+
+  useEffect(() => {
+    setLinks((prev) => {
+      const taskIds = new Set(taskSnapshotCache.map((task) => task.id))
+      return prev.map((link) => ({
+        ...link,
+        orphaned: !taskIds.has(link.taskId),
+      }))
+    })
+  }, [taskSnapshotCache])
+
+  useEffect(() => {
+    const unsubscribers: Array<() => void> = []
+
+    const subscribe = (event: string, handler: (payload: unknown) => void) => {
+      const wrapped = (payload: unknown) => handler(payload)
+      const maybeOff = (context.eventBus.on as unknown as (
+        eventName: string,
+        callback: (payload: unknown) => void,
+      ) => unknown)(event, wrapped)
+
+      if (typeof maybeOff === 'function') {
+        unsubscribers.push(maybeOff as () => void)
+        return
+      }
+
+      unsubscribers.push(() => {
+        context.eventBus.off(event, wrapped as (payload: any) => void)
+      })
+    }
+
+    subscribe(TASKBOARD_TASK_SELECTED, (payload) => {
+      const parsed = taskSelectedEventSchema.safeParse(payload)
+      if (!parsed.success) {
+        console.warn('[report-logger] rejected invalid event payload', {
+          event: TASKBOARD_TASK_SELECTED,
+          preview: previewText(payload),
+        })
+        return
+      }
+      setSelectedTaskId(parsed.data.taskId)
+    })
+
+    subscribe(TASKBOARD_TASK_UPDATED, (payload) => {
+      const parsed = taskUpdatedEventSchema.safeParse(payload)
+      if (!parsed.success) {
+        console.warn('[report-logger] rejected invalid event payload', {
+          event: TASKBOARD_TASK_UPDATED,
+          preview: previewText(payload),
+        })
+        return
+      }
+
+      const task = parsed.data.task
+      log.taskSyncReceived(task.id)
+      setTaskSnapshotCache((prev) => {
+        const idx = prev.findIndex((item) => item.id === task.id)
+        if (idx < 0) {
+          return [...prev, task]
+        }
+        const next = [...prev]
+        next[idx] = task
+        return next
+      })
+
+      setReports((prev) =>
+        prev.map((report) => {
+          if (report.taskId !== task.id) {
+            return report
+          }
+          const titleChanged = report.taskSnapshot?.title && report.taskSnapshot.title !== task.title
+          return {
+            ...report,
+            taskSnapshot: task,
+            taskChanged: Boolean(titleChanged),
+            timeline: [
+              ...report.timeline,
+              {
+                id: uid('tl'),
+                type: 'sync',
+                message: 'Task snapshot updated from TaskBoard',
+                at: Date.now(),
+                by: 'taskboard',
+              },
+            ],
+          }
+        }),
+      )
+    })
+
+    subscribe(CASE_REPORT_UPDATED, (payload) => {
+      const parsed = reportUpdatedEventSchema.safeParse(payload)
+      if (!parsed.success) {
+        console.warn('[report-logger] rejected invalid event payload', {
+          event: CASE_REPORT_UPDATED,
+          preview: previewText(payload),
+        })
+        return
+      }
+
+      const report = reports.find((item) => item.id === parsed.data.reportId)
+      if (!report) {
+        return
+      }
+
+      if (parsed.data.sourcePluginId === PLUGIN_ID) {
+        return
+      }
+
+      if (parsed.data.updatedAt > report.updatedAt && editorDirty) {
+        log.conflictDetected(report.id)
+        setConflict({
+          reportId: report.id,
+          externalUpdatedAt: parsed.data.updatedAt,
+          localUpdatedAt: report.updatedAt,
+        })
+      }
+    })
+
+    subscribe(CASE_REPORT_LINK_CREATED, (payload) => {
+      const parsed = linkCreatedEventSchema.safeParse(payload)
+      if (!parsed.success) {
+        console.warn('[report-logger] rejected invalid event payload', {
+          event: CASE_REPORT_LINK_CREATED,
+          preview: previewText(payload),
+        })
+        return
+      }
+
+      if (parsed.data.sourcePluginId === PLUGIN_ID) {
+        return
+      }
+
+      setLinks((prev) => {
+        const exists = prev.some((item) => item.taskId === parsed.data.taskId)
+        if (exists) {
+          return prev
+        }
+        return [
+          ...prev,
+          {
+            taskId: parsed.data.taskId,
+            reportId: parsed.data.reportId,
+            linkedAt: Date.now(),
+            linkedBy: 'external',
+            sourcePluginId: parsed.data.sourcePluginId,
+            orphaned: false,
+            history: [],
+          },
+        ]
+      })
+    })
+
+    subscribe(CASE_REPORT_TEMPLATE_IMPORTED, (payload) => {
+      const parsed = templateImportedEventSchema.safeParse(payload)
+      if (!parsed.success) {
+        console.warn('[report-logger] rejected invalid event payload', {
+          event: CASE_REPORT_TEMPLATE_IMPORTED,
+          preview: previewText(payload),
+        })
+      }
+    })
+
+    return () => {
+      for (const off of unsubscribers) {
+        off()
+      }
+    }
+  }, [context.eventBus, editorDirty, reports])
+
+  const createReport = (templateId?: string) => {
+    const linkedTask = selectedTask ?? null
+    const selectedTemplate = templateId ? templates.find((item) => item.id === templateId) : null
+    const templateApplied = selectedTemplate
+      ? resolveTemplate(selectedTemplate.content, linkedTask, AUTHOR_FALLBACK)
+      : { text: '', unresolved: [] }
+
+    setUnresolvedPlaceholders(templateApplied.unresolved)
+
+    const reportId = uid('report')
+    const now = Date.now()
+    const report: Report = {
+      id: reportId,
+      taskId: linkedTask?.id ?? null,
+      title: linkedTask ? `Case Report - ${linkedTask.title}` : 'Case Report',
+      content: templateApplied.text,
+      status: 'draft',
+      tags: [],
+      timeline: [
+        {
+          id: uid('tl'),
+          type: 'created',
+          message: 'Report created',
+          at: now,
+          by: AUTHOR_FALLBACK,
+        },
+      ],
+      updatedAt: now,
+      taskSnapshot: linkedTask,
+      taskChanged: false,
+    }
+
+    setReports((prev) => [report, ...prev])
+    setSelectedReportId(reportId)
+    setEditorValue(report.content)
+
+    if (linkedTask) {
+      linkReport(linkedTask.id, reportId)
+    }
+
+    context.eventBus.emit(TASK_COUNT_CHANGED, { count: reports.length + 1 })
+  }
+
+  const linkReport = (taskId: string, reportId: string) => {
+    try {
+      log.linkCreateStart(taskId, reportId)
+      setLinks((prev) => {
+        const current = prev.find((item) => item.taskId === taskId)
+        const now = Date.now()
+
+        if (!current) {
+          const created: TaskReportLink = {
+            taskId,
+            reportId,
+            linkedAt: now,
+            linkedBy: AUTHOR_FALLBACK,
+            sourcePluginId: PLUGIN_ID,
+            orphaned: false,
+            history: [],
+          }
+          return [...prev, created]
+        }
+
+        return prev.map((item) => {
+          if (item.taskId !== taskId) {
+            return item
+          }
+          return {
+            ...item,
+            reportId,
+            linkedAt: now,
+            linkedBy: AUTHOR_FALLBACK,
+            orphaned: false,
+            history: [
+              ...item.history,
+              { reportId: item.reportId, linkedAt: item.linkedAt, linkedBy: item.linkedBy },
+            ],
+          }
+        })
+      })
+
+      context.eventBus.emit(CASE_REPORT_LINK_CREATED, {
+        taskId,
+        reportId,
+        sourcePluginId: PLUGIN_ID,
+      })
+      log.linkCreateSuccess(taskId, reportId)
+    } catch (error) {
+      log.linkCreateFailed(error)
+    }
+  }
+
+  const onTemplateFileImport = async (file: File) => {
+    log.templateImportStart(file.name)
+    try {
+      const text = await file.text()
+      const templatesFromFile = parseTemplateFromFile(text)
+      if (templatesFromFile.length === 0) {
+        throw new Error('No valid template in file')
+      }
+
+      setTemplates((prev) => {
+        const dedupe = new Map(prev.map((item) => [item.id, item]))
+        for (const item of templatesFromFile) {
+          dedupe.set(item.id, item)
+          context.eventBus.emit(CASE_REPORT_TEMPLATE_IMPORTED, {
+            templateId: item.id,
+            name: item.name,
+            sourcePluginId: PLUGIN_ID,
+          })
+        }
+        return Array.from(dedupe.values())
+      })
+
+      log.templateImportSuccess(templatesFromFile[0].id)
+    } catch (error) {
+      log.templateImportFailed(error)
+    }
+  }
+
+  const importPastedTemplate = () => {
+    log.templateImportStart(templateName)
+    try {
+      const now = Date.now()
+      const candidate = {
+        id: uid('tpl'),
+        name: templateName,
+        category: templateCategory,
+        content: templatePaste,
+        createdAt: now,
+        updatedAt: now,
+        version: DATA_VERSION,
+      }
+      const parsed = templateSchema.parse(candidate)
+      setTemplates((prev) => [parsed, ...prev])
+      context.eventBus.emit(CASE_REPORT_TEMPLATE_IMPORTED, {
+        templateId: parsed.id,
+        name: parsed.name,
+        sourcePluginId: PLUGIN_ID,
+      })
+      setTemplatePaste('')
+      log.templateImportSuccess(parsed.id)
+    } catch (error) {
+      log.templateImportFailed(error)
+    }
+  }
+
+  const applyTemplateToSelectedReport = (templateId: string) => {
+    if (!selectedReport) {
+      return
+    }
+    const template = templates.find((item) => item.id === templateId)
+    if (!template) {
+      return
+    }
+    const confirmed = window.confirm('Apply template and overwrite current report content?')
+    if (!confirmed) {
+      return
+    }
+    const resolved = resolveTemplate(template.content, selectedTask, AUTHOR_FALLBACK)
+    setUnresolvedPlaceholders(resolved.unresolved)
+    setEditorValue(resolved.text)
+    setEditorDirty(true)
+  }
+
+  const exportSelectedReport = () => {
+    if (!selectedReport) {
+      return
+    }
+
+    const blob = new Blob([editorValue], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `${selectedReport.title.replace(/\s+/g, '-').toLowerCase()}.md`
+    anchor.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const commitConflictChoice = (choice: ConflictChoice) => {
+    if (!conflict || !selectedReport) {
+      return
+    }
+    conflictChoiceRef.current = choice
+    setReports((prev) =>
+      prev.map((report) => {
+        if (report.id !== conflict.reportId) {
+          return report
+        }
+        const message =
+          choice === 'local'
+            ? 'Conflict resolved: keep local draft'
+            : choice === 'external'
+              ? 'Conflict resolved: accept external update'
+              : 'Conflict resolved: manual merge'
+        return {
+          ...report,
+          timeline: [
+            ...report.timeline,
+            {
+              id: uid('tl'),
+              type: 'decision',
+              message,
+              at: Date.now(),
+              by: AUTHOR_FALLBACK,
+            },
+          ],
+          updatedAt: choice === 'external' ? conflict.externalUpdatedAt : report.updatedAt,
+        }
+      }),
+    )
+    setConflict(null)
+  }
+
+  const selectedLink = links.find((link) => link.taskId === selectedTaskId) ?? null
+
+  return (
+    <div className="report-logger">
+      <header className="rl-header">
+        <h1 className="rl-title">Report Logger</h1>
+        <div className="rl-pill">Hydrated: {hydrated ? 'yes' : 'no'}</div>
+      </header>
+
+      {selectedReport?.taskChanged ? (
+        <div className="rl-warning">Task title changed in TaskBoard. Decide whether to sync report text.</div>
+      ) : null}
+
+      {conflict ? (
+        <div className="rl-warning">
+          Conflict detected for report {conflict.reportId}. Local: {formatDate(conflict.localUpdatedAt)}; External:{' '}
+          {formatDate(conflict.externalUpdatedAt)}
+          <div className="rl-form-row" style={{ marginTop: 8 }}>
+            <button className="rl-button secondary" onClick={() => commitConflictChoice('local')}>
+              Keep Local
+            </button>
+            <button className="rl-button secondary" onClick={() => commitConflictChoice('external')}>
+              Accept External
+            </button>
+            <button className="rl-button secondary" onClick={() => commitConflictChoice('manual')}>
+              Manual Merge
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="rl-grid">
+        <aside className="rl-panel">
+          <h2 className="rl-section-title">Task Snapshot Cache</h2>
+          <div className="rl-list">
+            {taskSnapshotCache.map((task) => (
+              <button
+                key={task.id}
+                className="rl-item"
+                data-active={task.id === selectedTaskId}
+                onClick={() => setSelectedTaskId(task.id)}
+              >
+                <div>{task.title}</div>
+                <div className="rl-meta">{task.id}</div>
+              </button>
+            ))}
+          </div>
+          <div className="rl-form-row" style={{ marginTop: 10 }}>
+            <button className="rl-button" onClick={() => createReport()}>
+              New Report
+            </button>
+            <button
+              className="rl-button secondary"
+              onClick={() => {
+                if (!selectedTaskId || !selectedReportId) {
+                  return
+                }
+                linkReport(selectedTaskId, selectedReportId)
+              }}
+            >
+              Rebind Task
+            </button>
+          </div>
+          {selectedLink ? (
+            <div className="rl-meta">
+              Linked report: {selectedLink.reportId} {selectedLink.orphaned ? '(orphaned)' : ''}
+            </div>
+          ) : null}
+        </aside>
+
+        <section className="rl-panel">
+          <h2 className="rl-section-title">Markdown Editor</h2>
+
+          <div className="rl-form-row">
+            <select
+              className="rl-select"
+              onChange={(e) => {
+                if (e.target.value) {
+                  applyTemplateToSelectedReport(e.target.value)
+                }
+              }}
+              value=""
+            >
+              <option value="">Apply template to selected report</option>
+              {templates.map((template) => (
+                <option key={template.id} value={template.id}>
+                  {template.name} [{template.category}]
+                </option>
+              ))}
+            </select>
+            <button className="rl-button secondary" onClick={exportSelectedReport}>
+              Export Markdown
+            </button>
+          </div>
+
+          {unresolvedPlaceholders.length > 0 ? (
+            <div className="rl-warning">Unresolved placeholders: {unresolvedPlaceholders.join(', ')}</div>
+          ) : null}
+
+          <textarea
+            className="rl-textarea"
+            value={editorValue}
+            onChange={(e) => {
+              setEditorValue(e.target.value)
+              setEditorDirty(true)
+            }}
+            placeholder="Write report progress in markdown..."
+          />
+
+          <div className="rl-footer">
+            <span>Selected report: {selectedReport?.id ?? 'none'}</span>
+            <span>Autosave: {editorDirty ? 'pending' : 'synced'}</span>
+          </div>
+        </section>
+
+        <section className="rl-panel">
+          <h2 className="rl-section-title">Reports</h2>
+          <div className="rl-list">
+            {reports.map((report) => (
+              <button
+                key={report.id}
+                className="rl-item"
+                data-active={report.id === selectedReportId}
+                onClick={() => setSelectedReportId(report.id)}
+              >
+                <div>{report.title}</div>
+                <div className="rl-meta">
+                  <span className="rl-badge">{report.status}</span> Updated {formatDate(report.updatedAt)}
+                </div>
+              </button>
+            ))}
+          </div>
+
+          <h2 className="rl-section-title" style={{ marginTop: 14 }}>
+            Import Template
+          </h2>
+          <div className="rl-form-row">
+            <input
+              className="rl-input"
+              type="file"
+              accept=".md,.txt,.json"
+              onChange={(e) => {
+                const file = e.target.files?.[0]
+                if (file) {
+                  onTemplateFileImport(file)
+                }
+                e.currentTarget.value = ''
+              }}
+            />
+          </div>
+          <div className="rl-form-row">
+            <input
+              className="rl-input"
+              value={templateName}
+              onChange={(e) => setTemplateName(e.target.value)}
+              placeholder="Template name"
+            />
+            <input
+              className="rl-input"
+              value={templateCategory}
+              onChange={(e) => setTemplateCategory(e.target.value)}
+              placeholder="Template category"
+            />
+          </div>
+          <div className="rl-form-row">
+            <textarea
+              className="rl-textarea"
+              style={{ minHeight: 120 }}
+              value={templatePaste}
+              onChange={(e) => setTemplatePaste(e.target.value)}
+              placeholder="Paste plain text template here..."
+            />
+          </div>
+          <div className="rl-form-row">
+            <button className="rl-button" onClick={importPastedTemplate}>
+              Import Pasted Template
+            </button>
+            <button
+              className="rl-button secondary"
+              onClick={() => {
+                const latest = templates[0]
+                if (latest) {
+                  createReport(latest.id)
+                }
+              }}
+            >
+              Create Report with Latest Template
+            </button>
+          </div>
+        </section>
+      </div>
+    </div>
+  )
+}
+
+let root: Root | null = null
+let mountNode: HTMLElement | null = null
+
+const plugin: IPlugin = {
+  id: PLUGIN_ID,
+  name: 'Report Logger',
+  version: DATA_VERSION,
+  mount(container, context) {
+    if (mountNode) {
+      mountNode.remove()
+      mountNode = null
+    }
+
+    const shellId = `plugin-${PLUGIN_ID}`
+    const shell = document.createElement('div')
+    shell.id = shellId
+    shell.style.minHeight = '100%'
+    container.appendChild(shell)
+
+    mountNode = shell
+    root = createRoot(shell)
+    root.render(React.createElement(ReportLoggerApp, { context }))
+  },
+  unmount() {
+    if (root) {
+      root.unmount()
+      root = null
+    }
+    if (mountNode) {
+      mountNode.innerHTML = ''
+      mountNode.remove()
+      mountNode = null
+    }
+  },
+}
+
+export default plugin
