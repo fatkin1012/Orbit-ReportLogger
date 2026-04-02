@@ -51,6 +51,12 @@
   gap: 8px;
 }
 
+.rl-sidebar-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .rl-create-controls {
   display: flex;
   align-items: center;
@@ -422,6 +428,21 @@
   border-color: var(--accent);
   background: #ffefee;
   color: #773835;
+}
+
+.rl-icon-button {
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.rl-icon {
+  width: 18px;
+  height: 18px;
 }
 
 .rl-warning {

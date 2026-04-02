@@ -406,6 +406,62 @@ function composeTemplateDraft(items: TemplateDraftItem[]): string {
   return parts.join('\n').trim()
 }
 
+function parseTemplateDraftItems(content: string): TemplateDraftItem[] {
+  const lines = content.split('\n')
+  const items: TemplateDraftItem[] = []
+
+  let currentKind: TemplateKind | null = null
+  let currentTitle = ''
+  let currentValueLines: string[] = []
+
+  const commitItem = () => {
+    if (!currentKind) {
+      return
+    }
+
+    items.push({
+      id: uid('tpl-item'),
+      kind: currentKind,
+      title: currentTitle,
+      value: currentKind === '##' ? '' : currentValueLines.join('\n').trim(),
+    })
+
+    currentKind = null
+    currentTitle = ''
+    currentValueLines = []
+  }
+
+  for (const line of lines) {
+    if (line.startsWith('### ')) {
+      commitItem()
+      currentKind = '###'
+      currentTitle = line.slice(4).trim()
+      continue
+    }
+
+    if (line.startsWith('## ') && !line.startsWith('### ')) {
+      commitItem()
+      currentKind = '##'
+      currentTitle = line.slice(3).trim()
+      continue
+    }
+
+    if (line.startsWith('# ') && !line.startsWith('## ') && !line.startsWith('### ')) {
+      commitItem()
+      currentKind = '#'
+      currentTitle = line.slice(2).trim()
+      continue
+    }
+
+    if (currentKind && currentKind !== '##') {
+      currentValueLines.push(line)
+    }
+  }
+
+  commitItem()
+  return items
+}
+
 function extractPrimaryFieldContent(content: string): string | null {
   const parsed = parseTemplateSections(content)
   const primaryField = parsed.fields.find((field) => !field.section)
@@ -558,6 +614,7 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
   const [templateDraftName, setTemplateDraftName] = useState('Untitled txt Template')
   const [templateDraftCategory, setTemplateDraftCategory] = useState('general')
   const [templateDraftItems, setTemplateDraftItems] = useState<TemplateDraftItem[]>([])
+  const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null)
   const [editorValue, setEditorValue] = useState('')
   const [editorDirty, setEditorDirty] = useState(false)
   const [lastSaveError, setLastSaveError] = useState('')
@@ -570,6 +627,8 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
   const reportFieldTextareasRef = useRef<Record<string, HTMLTextAreaElement | null>>({})
   const activeImageTargetRef = useRef<string | null>(null)
   const imagePickerRef = useRef<HTMLInputElement | null>(null)
+  const templateImportInputRef = useRef<HTMLInputElement | null>(null)
+  const reportImportInputRef = useRef<HTMLInputElement | null>(null)
 
   const selectedTask = useMemo(
     () => taskSnapshotCache.find((task) => task.id === selectedTaskId) ?? null,
@@ -600,6 +659,7 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
     setTemplateDraftName('Untitled txt Template')
     setTemplateDraftCategory('general')
     setTemplateDraftItems([])
+    setEditingTemplateId(null)
   }
 
   const openTemplateBuilder = () => {
@@ -626,23 +686,54 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
   const saveTemplateDraft = () => {
     const content = composeTemplateDraft(templateDraftItems)
     const now = Date.now()
-    const candidate = {
-      id: uid('tpl'),
-      name: templateDraftName.trim() || 'Untitled txt Template',
-      category: templateDraftCategory.trim() || 'general',
-      content,
-      createdAt: now,
-      updatedAt: now,
-      version: DATA_VERSION,
+    const draftName = templateDraftName.trim() || 'Untitled txt Template'
+    const draftCategory = templateDraftCategory.trim() || 'general'
+
+    if (editingTemplateId) {
+      setTemplates((prev) =>
+        prev.map((template) => {
+          if (template.id !== editingTemplateId) {
+            return template
+          }
+
+          const candidate = {
+            ...template,
+            name: draftName,
+            category: draftCategory,
+            content,
+            updatedAt: now,
+            version: DATA_VERSION,
+          }
+          const parsed = templateSchema.parse(candidate)
+          return parsed
+        }),
+      )
+
+      context.eventBus.emit(CASE_REPORT_TEMPLATE_IMPORTED, {
+        templateId: editingTemplateId,
+        name: draftName,
+        sourcePluginId: PLUGIN_ID,
+      })
+    } else {
+      const candidate = {
+        id: uid('tpl'),
+        name: draftName,
+        category: draftCategory,
+        content,
+        createdAt: now,
+        updatedAt: now,
+        version: DATA_VERSION,
+      }
+
+      const parsed = templateSchema.parse(candidate)
+      setTemplates((prev) => [parsed, ...prev])
+      context.eventBus.emit(CASE_REPORT_TEMPLATE_IMPORTED, {
+        templateId: parsed.id,
+        name: parsed.name,
+        sourcePluginId: PLUGIN_ID,
+      })
     }
 
-    const parsed = templateSchema.parse(candidate)
-    setTemplates((prev) => [parsed, ...prev])
-    context.eventBus.emit(CASE_REPORT_TEMPLATE_IMPORTED, {
-      templateId: parsed.id,
-      name: parsed.name,
-      sourcePluginId: PLUGIN_ID,
-    })
     resetTemplateDraft()
     setWorkspaceMode('report')
   }
@@ -650,6 +741,278 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
   const cancelTemplateBuilder = () => {
     resetTemplateDraft()
     setWorkspaceMode('report')
+  }
+
+  const editTemplate = (templateId: string) => {
+    const target = templates.find((template) => template.id === templateId)
+    if (!target) {
+      return
+    }
+
+    setTemplateDraftName(target.name)
+    setTemplateDraftCategory(target.category)
+    setTemplateDraftItems(parseTemplateDraftItems(target.content))
+    setEditingTemplateId(target.id)
+    setWorkspaceMode('template')
+  }
+
+  const deleteTemplate = (templateId: string) => {
+    const target = templates.find((template) => template.id === templateId)
+    const confirmed = window.confirm(`Delete template "${target?.name ?? 'Untitled Template'}"?`)
+    if (!confirmed) {
+      return
+    }
+
+    setTemplates((prev) => prev.filter((template) => template.id !== templateId))
+    setReports((prev) =>
+      prev.map((report) =>
+        report.templateId === templateId
+          ? { ...report, templateId: null }
+          : report,
+      ),
+    )
+
+    if (templateToApply === templateId) {
+      setTemplateToApply('')
+    }
+    if (editingTemplateId === templateId) {
+      resetTemplateDraft()
+    }
+  }
+
+  const exportTemplates = () => {
+    if (templates.length === 0) {
+      window.alert('No templates to export.')
+      return
+    }
+
+    const payload = {
+      format: 'report-logger-template-bundle',
+      version: DATA_VERSION,
+      exportedAt: Date.now(),
+      templates,
+    }
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `report-logger-templates-${new Date().toISOString().slice(0, 10)}.json`
+    anchor.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const normalizeImportedTemplate = (item: unknown): Template | null => {
+    if (!item || typeof item !== 'object') {
+      return null
+    }
+
+    const rec = item as Record<string, unknown>
+    const now = Date.now()
+    const candidate = {
+      id: typeof rec.id === 'string' && rec.id.trim() ? rec.id : uid('tpl'),
+      name: typeof rec.name === 'string' && rec.name.trim() ? rec.name : 'Imported Template',
+      category: typeof rec.category === 'string' && rec.category.trim() ? rec.category : 'general',
+      content: typeof rec.content === 'string' ? rec.content : '',
+      createdAt: typeof rec.createdAt === 'number' ? rec.createdAt : now,
+      updatedAt: typeof rec.updatedAt === 'number' ? rec.updatedAt : now,
+      version: typeof rec.version === 'string' && rec.version.trim() ? rec.version : DATA_VERSION,
+    }
+
+    const parsed = templateSchema.safeParse(candidate)
+    return parsed.success ? parsed.data : null
+  }
+
+  const importTemplatesFromFile = async (file: File) => {
+    const rawText = await file.text()
+    const parsed = safeJsonParse(rawText)
+
+    if (parsed === null) {
+      window.alert('Invalid template file: JSON parse failed.')
+      return
+    }
+
+    let sourceItems: unknown[] = []
+    if (Array.isArray(parsed)) {
+      sourceItems = parsed
+    } else if (parsed && typeof parsed === 'object') {
+      const rec = parsed as Record<string, unknown>
+      sourceItems = Array.isArray(rec.templates) ? rec.templates : [parsed]
+    }
+
+    const normalized = sourceItems
+      .map((item) => normalizeImportedTemplate(item))
+      .filter((item): item is Template => item !== null)
+
+    if (normalized.length === 0) {
+      window.alert('No valid templates found in file.')
+      return
+    }
+
+    const acceptedTemplates: Template[] = []
+    let skippedCount = 0
+
+    setTemplates((prev) => {
+      const existingKeys = new Set(prev.map((tpl) => `${tpl.name}::${tpl.category}::${tpl.content}`))
+      const importKeys = new Set<string>()
+
+      for (const tpl of normalized) {
+        const key = `${tpl.name}::${tpl.category}::${tpl.content}`
+        if (existingKeys.has(key) || importKeys.has(key)) {
+          skippedCount += 1
+          continue
+        }
+        importKeys.add(key)
+        acceptedTemplates.push(tpl)
+      }
+
+      return acceptedTemplates.length > 0 ? [...acceptedTemplates, ...prev] : prev
+    })
+
+    for (const tpl of acceptedTemplates) {
+      context.eventBus.emit(CASE_REPORT_TEMPLATE_IMPORTED, {
+        templateId: tpl.id,
+        name: tpl.name,
+        sourcePluginId: PLUGIN_ID,
+      })
+    }
+
+    window.alert(
+      acceptedTemplates.length > 0
+        ? `Imported ${acceptedTemplates.length} template(s). Skipped ${skippedCount} duplicate(s).`
+        : `No new templates imported. Skipped ${skippedCount} duplicate(s).`,
+    )
+  }
+
+  const exportAllReports = () => {
+    if (reports.length === 0) {
+      window.alert('No documents to export.')
+      return
+    }
+
+    const payload = {
+      format: 'report-logger-document-bundle',
+      version: DATA_VERSION,
+      exportedAt: Date.now(),
+      reports,
+    }
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `report-logger-documents-${new Date().toISOString().slice(0, 10)}.json`
+    anchor.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const normalizeImportedReport = (item: unknown): Report | null => {
+    if (!item || typeof item !== 'object') {
+      return null
+    }
+
+    const direct = reportSchema.safeParse(item)
+    if (direct.success) {
+      return direct.data
+    }
+
+    const rec = item as Record<string, unknown>
+    const now = Date.now()
+    const content = typeof rec.content === 'string' ? rec.content : ''
+    const taskSnapshotParsed = taskSnapshotSchema.safeParse(rec.taskSnapshot)
+    const candidate = {
+      id: typeof rec.id === 'string' && rec.id.trim() ? rec.id : uid('report'),
+      taskId: typeof rec.taskId === 'string' ? rec.taskId : null,
+      templateId: typeof rec.templateId === 'string' ? rec.templateId : null,
+      title:
+        typeof rec.title === 'string' && rec.title.trim()
+          ? rec.title
+          : buildDocumentTitle('imported', content, 'Imported Document'),
+      content,
+      status:
+        rec.status === 'active' || rec.status === 'blocked' || rec.status === 'closed' || rec.status === 'draft'
+          ? rec.status
+          : 'draft',
+      tags: Array.isArray(rec.tags) ? rec.tags.filter((tag): tag is string => typeof tag === 'string') : [],
+      timeline: [],
+      updatedAt: typeof rec.updatedAt === 'number' ? rec.updatedAt : now,
+      taskSnapshot: taskSnapshotParsed.success ? taskSnapshotParsed.data : null,
+      taskChanged: typeof rec.taskChanged === 'boolean' ? rec.taskChanged : false,
+    }
+
+    const parsed = reportSchema.safeParse(candidate)
+    return parsed.success ? parsed.data : null
+  }
+
+  const importReportsFromFile = async (file: File) => {
+    const rawText = await file.text()
+    const parsed = safeJsonParse(rawText)
+
+    if (parsed === null) {
+      window.alert('Invalid document file: JSON parse failed.')
+      return
+    }
+
+    let sourceItems: unknown[] = []
+    if (Array.isArray(parsed)) {
+      sourceItems = parsed
+    } else if (parsed && typeof parsed === 'object') {
+      const rec = parsed as Record<string, unknown>
+      sourceItems = Array.isArray(rec.reports) ? rec.reports : [parsed]
+    }
+
+    const normalized = sourceItems
+      .map((item) => normalizeImportedReport(item))
+      .filter((item): item is Report => item !== null)
+
+    if (normalized.length === 0) {
+      window.alert('No valid documents found in file.')
+      return
+    }
+
+    const acceptedReports: Report[] = []
+    let skippedCount = 0
+
+    setReports((prev) => {
+      const existingIds = new Set(prev.map((report) => report.id))
+      const existingKeys = new Set(prev.map((report) => `${report.title}::${report.content}`))
+      const importKeys = new Set<string>()
+
+      for (const report of normalized) {
+        const key = `${report.title}::${report.content}`
+        if (existingKeys.has(key) || importKeys.has(key)) {
+          skippedCount += 1
+          continue
+        }
+
+        importKeys.add(key)
+        const nextReport = existingIds.has(report.id)
+          ? { ...report, id: uid('report') }
+          : report
+        acceptedReports.push(nextReport)
+      }
+
+      return acceptedReports.length > 0 ? [...acceptedReports, ...prev] : prev
+    })
+
+    if (acceptedReports.length > 0 && !selectedReportId) {
+      setSelectedReportId(acceptedReports[0].id)
+      setEditorValue(acceptedReports[0].content)
+    }
+
+    if (acceptedReports.length > 0) {
+      context.eventBus.emit(TASK_COUNT_CHANGED, { count: reports.length + acceptedReports.length })
+    }
+
+    window.alert(
+      acceptedReports.length > 0
+        ? `Imported ${acceptedReports.length} document(s). Skipped ${skippedCount} duplicate(s).`
+        : `No new documents imported. Skipped ${skippedCount} duplicate(s).`,
+    )
   }
 
   const throttledDraftSave = useMemo(
@@ -1136,8 +1499,36 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
           value: restoreRawValueFromDisplay(field.value, nextValue),
         }
       })
-      setEditorValue(composeTemplateSections(nextFields))
+      const nextContent = composeTemplateSections(nextFields)
+      setEditorValue(nextContent)
       setEditorDirty(true)
+
+      if (selectedReportId) {
+        setReports((prevReports) =>
+          prevReports.map((report) => {
+            if (report.id !== selectedReportId) {
+              return report
+            }
+
+            const resolvedTemplateId =
+              report.templateId ?? templateToApply ?? inferTemplateIdFromContent(report.content, templates)
+            const resolvedTemplate = resolvedTemplateId
+              ? templates.find((item) => item.id === resolvedTemplateId)
+              : null
+
+            if (!resolvedTemplate) {
+              return report
+            }
+
+            return {
+              ...report,
+              title: buildDocumentTitle(resolvedTemplate.category, nextContent, report.title),
+              templateId: report.templateId ?? resolvedTemplate.id,
+            }
+          }),
+        )
+      }
+
       return nextFields
     })
   }
@@ -1308,6 +1699,32 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
   return (
     <div className="report-logger">
       <input
+        ref={reportImportInputRef}
+        className="rl-hidden-file-input"
+        type="file"
+        accept="application/json,.json"
+        onChange={async (e) => {
+          const file = e.target.files?.[0]
+          if (file) {
+            await importReportsFromFile(file)
+          }
+          e.currentTarget.value = ''
+        }}
+      />
+      <input
+        ref={templateImportInputRef}
+        className="rl-hidden-file-input"
+        type="file"
+        accept="application/json,.json"
+        onChange={async (e) => {
+          const file = e.target.files?.[0]
+          if (file) {
+            await importTemplatesFromFile(file)
+          }
+          e.currentTarget.value = ''
+        }}
+      />
+      <input
         ref={imagePickerRef}
         className="rl-hidden-file-input"
         type="file"
@@ -1324,6 +1741,32 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
         <aside className="rl-panel rl-sidebar">
           <div className="rl-sidebar-head">
             <h1 className="rl-title">Documents</h1>
+            <div className="rl-sidebar-head-actions">
+              <button
+                className="rl-button secondary rl-icon-button"
+                aria-label="Import documents"
+                title="Import documents"
+                onClick={() => reportImportInputRef.current?.click()}
+              >
+                <svg className="rl-icon" viewBox="0 0 20 20" aria-hidden="true">
+                  <path d="M10 2v8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                  <path d="M6.5 7.5 10 11l3.5-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                  <path d="M3 13.5h14v3.5H3z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+                </svg>
+              </button>
+              <button
+                className="rl-button secondary rl-icon-button"
+                aria-label="Export all documents"
+                title="Export all documents"
+                onClick={exportAllReports}
+              >
+                <svg className="rl-icon" viewBox="0 0 20 20" aria-hidden="true">
+                  <path d="M10 10V2" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                  <path d="M6.5 5.5 10 2l3.5 3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                  <path d="M3 13.5h14v3.5H3z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+                </svg>
+              </button>
+            </div>
           </div>
 
           <div className="rl-create-controls">
@@ -1395,15 +1838,39 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
             <>
               <div className="rl-workspace-head">
                 <div>
-                  <h2 className="rl-section-title">Create Template</h2>
+                  <h2 className="rl-section-title">{editingTemplateId ? 'Edit Template' : 'Create Template'}</h2>
                   <div className="rl-meta">Build a txt template by adding # / ## / ### items.</div>
                 </div>
                 <div className="rl-form-row">
+                  <button
+                    className="rl-button secondary rl-icon-button"
+                    aria-label="Import template"
+                    title="Import template"
+                    onClick={() => templateImportInputRef.current?.click()}
+                  >
+                    <svg className="rl-icon" viewBox="0 0 20 20" aria-hidden="true">
+                      <path d="M10 2v8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                      <path d="M6.5 7.5 10 11l3.5-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                      <path d="M3 13.5h14v3.5H3z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+                    </svg>
+                  </button>
+                  <button
+                    className="rl-button secondary rl-icon-button"
+                    aria-label="Export templates"
+                    title="Export templates"
+                    onClick={exportTemplates}
+                  >
+                    <svg className="rl-icon" viewBox="0 0 20 20" aria-hidden="true">
+                      <path d="M10 10V2" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                      <path d="M6.5 5.5 10 2l3.5 3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                      <path d="M3 13.5h14v3.5H3z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+                    </svg>
+                  </button>
                   <button className="rl-button secondary" onClick={addTemplateDraftItem}>
                     + Add Item
                   </button>
                   <button className="rl-button secondary" onClick={saveTemplateDraft}>
-                    Save Template
+                    {editingTemplateId ? 'Update Template' : 'Save Template'}
                   </button>
                   <button className="rl-button secondary" onClick={cancelTemplateBuilder}>
                     Cancel
@@ -1464,6 +1931,31 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
                       ) : (
                         <div className="rl-template-kind-note">## is a section header only, no input field.</div>
                       )}
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <div className="rl-form-sheet" aria-label="Template manager">
+                <div className="rl-form-item-head">
+                  <div className="rl-form-item-label">Template Library</div>
+                </div>
+                {templates.length === 0 ? (
+                  <div className="rl-empty-state">No templates available.</div>
+                ) : (
+                  templates.map((template) => (
+                    <div key={template.id} className="rl-item rl-item-card" data-active={editingTemplateId === template.id}>
+                      <button
+                        className="rl-item-main"
+                        onClick={() => editTemplate(template.id)}
+                      >
+                        <div className="rl-item-title">{template.name}</div>
+                        <div className="rl-meta">{template.category}</div>
+                        <div className="rl-meta">Updated {formatDate(template.updatedAt)}</div>
+                      </button>
+                      <button className="rl-item-delete" onClick={() => deleteTemplate(template.id)}>
+                        Delete
+                      </button>
                     </div>
                   ))
                 )}
