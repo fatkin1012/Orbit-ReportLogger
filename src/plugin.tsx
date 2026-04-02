@@ -1,3 +1,4 @@
+/* @refresh skip */
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import type { DataEnvelope, IAppContext, IPlugin } from '@toolbox/sdk'
@@ -47,6 +48,13 @@ type ConflictState = {
   externalUpdatedAt: number
   localUpdatedAt: number
 } | null
+
+type TemplateField = {
+  id: string
+  title: string
+  value: string
+  section?: string
+}
 
 const NAMESPACES = {
   taskboardTasks: 'taskboard.tasks',
@@ -265,23 +273,6 @@ async function restorePayload(context: IAppContext): Promise<{ payload: PayloadV
   return { payload, source: 'storage' }
 }
 
-function parseTemplateFromFile(content: string): Template[] {
-  const normalized = normalizeUnknown(content).value
-  if (Array.isArray(normalized)) {
-    return normalized
-      .map((item) => templateSchema.safeParse(item))
-      .filter((item) => item.success)
-      .map((item) => item.data)
-  }
-  if (normalized && typeof normalized === 'object') {
-    const parsed = templateSchema.safeParse(normalized)
-    if (parsed.success) {
-      return [parsed.data]
-    }
-  }
-  return []
-}
-
 function resolveTemplate(
   templateContent: string,
   task: TaskSnapshot | null,
@@ -302,6 +293,88 @@ function resolveTemplate(
   return { text, unresolved }
 }
 
+function parseTemplateSections(content: string): { fields: Array<{ title: string; value: string; section?: string }> } {
+  const lines = content.split('\n')
+  const fields: Array<{ title: string; value: string; section?: string }> = []
+
+  let currentSection: string | undefined = undefined
+  let currentFieldTitle: string | null = null
+  let currentFieldLines: string[] = []
+
+  const commitField = () => {
+    if (!currentFieldTitle) {
+      return
+    }
+    fields.push({
+      title: currentFieldTitle,
+      value: currentFieldLines.join('\n').trim(),
+      section: currentSection,
+    })
+    currentFieldTitle = null
+    currentFieldLines = []
+  }
+
+  for (const line of lines) {
+    if (line.startsWith('# ') && !line.startsWith('## ') && !line.startsWith('### ')) {
+      // Document title level - treat as editable field
+      commitField()
+      currentFieldTitle = line.slice(2).trim()
+      currentFieldLines = []
+      continue
+    }
+
+    if (line.startsWith('## ') && !line.startsWith('### ')) {
+      // Section heading - only for grouping, not editable
+      commitField()
+      currentSection = line.slice(3).trim()
+      currentFieldTitle = null
+      continue
+    }
+
+    if (line.startsWith('### ')) {
+      // Sub-item level - treat as editable field
+      commitField()
+      currentFieldTitle = line.slice(4).trim()
+      currentFieldLines = []
+      continue
+    }
+
+    if (currentFieldTitle) {
+      currentFieldLines.push(line)
+    }
+  }
+
+  commitField()
+
+  return {
+    fields,
+  }
+}
+
+function composeTemplateSections(fields: TemplateField[]): string {
+  const parts: string[] = []
+  let currentSection: string | undefined = undefined
+
+  for (const field of fields) {
+    const isFirstInSection = field.section && field.section !== currentSection
+    if (isFirstInSection) {
+      currentSection = field.section
+      parts.push(`## ${field.section}`)
+      parts.push('')
+    }
+
+    const isTitle = !field.section
+    const heading = isTitle ? '# ' : '### '
+    parts.push(`${heading}${field.title}`)
+    if (field.value.trim()) {
+      parts.push(field.value.trim())
+    }
+    parts.push('')
+  }
+
+  return parts.join('\n').trim()
+}
+
 function ReportLoggerApp({ context }: { context: IAppContext }) {
   const [reports, setReports] = useState<Report[]>([])
   const [links, setLinks] = useState<TaskReportLink[]>([])
@@ -311,9 +384,10 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
   const [selectedReportId, setSelectedReportId] = useState<string | null>(null)
   const [hydrated, setHydrated] = useState(false)
   const [syncSource, setSyncSource] = useState<SaveSource>('storage')
-  const [templatePaste, setTemplatePaste] = useState('')
-  const [templateName, setTemplateName] = useState('Pasted Template')
-  const [templateCategory, setTemplateCategory] = useState('general')
+  const [navQuery, setNavQuery] = useState('')
+  const [viewMode, setViewMode] = useState<'edit' | 'preview'>('edit')
+  const [templateToApply, setTemplateToApply] = useState('')
+  const [templateFields, setTemplateFields] = useState<TemplateField[]>([])
   const [editorValue, setEditorValue] = useState('')
   const [editorDirty, setEditorDirty] = useState(false)
   const [lastSaveError, setLastSaveError] = useState('')
@@ -332,6 +406,19 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
     () => reports.find((report) => report.id === selectedReportId) ?? null,
     [reports, selectedReportId],
   )
+
+  const filteredReports = useMemo(() => {
+    const query = navQuery.trim().toLowerCase()
+    if (!query) {
+      return reports
+    }
+
+    return reports.filter((report) => {
+      const title = report.title.toLowerCase()
+      const content = report.content.toLowerCase()
+      return title.includes(query) || content.includes(query)
+    })
+  }, [navQuery, reports])
 
   const throttledDraftSave = useMemo(
     () =>
@@ -404,13 +491,15 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
   }, [context])
 
   useEffect(() => {
-    if (!selectedReport) {
+    if (!selectedReportId) {
       setEditorValue('')
+      setTemplateFields([])
       return
     }
-    setEditorValue(selectedReport.content)
+    setEditorValue(selectedReport?.content ?? '')
     setEditorDirty(false)
-  }, [selectedReport])
+    setTemplateFields([])
+  }, [selectedReportId])
 
   useEffect(() => {
     if (!hydrated) {
@@ -736,61 +825,6 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
     }
   }
 
-  const onTemplateFileImport = async (file: File) => {
-    log.templateImportStart(file.name)
-    try {
-      const text = await file.text()
-      const templatesFromFile = parseTemplateFromFile(text)
-      if (templatesFromFile.length === 0) {
-        throw new Error('No valid template in file')
-      }
-
-      setTemplates((prev) => {
-        const dedupe = new Map(prev.map((item) => [item.id, item]))
-        for (const item of templatesFromFile) {
-          dedupe.set(item.id, item)
-          context.eventBus.emit(CASE_REPORT_TEMPLATE_IMPORTED, {
-            templateId: item.id,
-            name: item.name,
-            sourcePluginId: PLUGIN_ID,
-          })
-        }
-        return Array.from(dedupe.values())
-      })
-
-      log.templateImportSuccess(templatesFromFile[0].id)
-    } catch (error) {
-      log.templateImportFailed(error)
-    }
-  }
-
-  const importPastedTemplate = () => {
-    log.templateImportStart(templateName)
-    try {
-      const now = Date.now()
-      const candidate = {
-        id: uid('tpl'),
-        name: templateName,
-        category: templateCategory,
-        content: templatePaste,
-        createdAt: now,
-        updatedAt: now,
-        version: DATA_VERSION,
-      }
-      const parsed = templateSchema.parse(candidate)
-      setTemplates((prev) => [parsed, ...prev])
-      context.eventBus.emit(CASE_REPORT_TEMPLATE_IMPORTED, {
-        templateId: parsed.id,
-        name: parsed.name,
-        sourcePluginId: PLUGIN_ID,
-      })
-      setTemplatePaste('')
-      log.templateImportSuccess(parsed.id)
-    } catch (error) {
-      log.templateImportFailed(error)
-    }
-  }
-
   const applyTemplateToSelectedReport = (templateId: string) => {
     if (!selectedReport) {
       return
@@ -804,9 +838,21 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
       return
     }
     const resolved = resolveTemplate(template.content, selectedTask, AUTHOR_FALLBACK)
+    const parsed = parseTemplateSections(resolved.text)
+
+    setTemplateFields(parsed.fields.map((field) => ({ ...field, id: uid('field') })))
     setUnresolvedPlaceholders(resolved.unresolved)
     setEditorValue(resolved.text)
     setEditorDirty(true)
+  }
+
+  const updateTemplateField = (fieldId: string, nextValue: string) => {
+    setTemplateFields((prev) => {
+      const nextFields = prev.map((field) => (field.id === fieldId ? { ...field, value: nextValue } : field))
+      setEditorValue(composeTemplateSections(nextFields))
+      setEditorDirty(true)
+      return nextFields
+    })
   }
 
   const exportSelectedReport = () => {
@@ -862,191 +908,180 @@ function ReportLoggerApp({ context }: { context: IAppContext }) {
 
   return (
     <div className="report-logger">
-      <header className="rl-header">
-        <h1 className="rl-title">Report Logger</h1>
-        <div className="rl-pill">Hydrated: {hydrated ? 'yes' : 'no'}</div>
-      </header>
-
-      {selectedReport?.taskChanged ? (
-        <div className="rl-warning">Task title changed in TaskBoard. Decide whether to sync report text.</div>
-      ) : null}
-
-      {conflict ? (
-        <div className="rl-warning">
-          Conflict detected for report {conflict.reportId}. Local: {formatDate(conflict.localUpdatedAt)}; External:{' '}
-          {formatDate(conflict.externalUpdatedAt)}
-          <div className="rl-form-row" style={{ marginTop: 8 }}>
-            <button className="rl-button secondary" onClick={() => commitConflictChoice('local')}>
-              Keep Local
-            </button>
-            <button className="rl-button secondary" onClick={() => commitConflictChoice('external')}>
-              Accept External
-            </button>
-            <button className="rl-button secondary" onClick={() => commitConflictChoice('manual')}>
-              Manual Merge
-            </button>
-          </div>
-        </div>
-      ) : null}
-
-      <div className="rl-grid">
-        <aside className="rl-panel">
-          <h2 className="rl-section-title">Task Snapshot Cache</h2>
-          <div className="rl-list">
-            {taskSnapshotCache.map((task) => (
-              <button
-                key={task.id}
-                className="rl-item"
-                data-active={task.id === selectedTaskId}
-                onClick={() => setSelectedTaskId(task.id)}
-              >
-                <div>{task.title}</div>
-                <div className="rl-meta">{task.id}</div>
-              </button>
-            ))}
-          </div>
-          <div className="rl-form-row" style={{ marginTop: 10 }}>
+      <div className="rl-shell">
+        <aside className="rl-panel rl-sidebar">
+          <div className="rl-sidebar-head">
+            <h1 className="rl-title">Documents</h1>
             <button className="rl-button" onClick={() => createReport()}>
-              New Report
-            </button>
-            <button
-              className="rl-button secondary"
-              onClick={() => {
-                if (!selectedTaskId || !selectedReportId) {
-                  return
-                }
-                linkReport(selectedTaskId, selectedReportId)
-              }}
-            >
-              Rebind Task
-            </button>
-          </div>
-          {selectedLink ? (
-            <div className="rl-meta">
-              Linked report: {selectedLink.reportId} {selectedLink.orphaned ? '(orphaned)' : ''}
-            </div>
-          ) : null}
-        </aside>
-
-        <section className="rl-panel">
-          <h2 className="rl-section-title">Markdown Editor</h2>
-
-          <div className="rl-form-row">
-            <select
-              className="rl-select"
-              onChange={(e) => {
-                if (e.target.value) {
-                  applyTemplateToSelectedReport(e.target.value)
-                }
-              }}
-              value=""
-            >
-              <option value="">Apply template to selected report</option>
-              {templates.map((template) => (
-                <option key={template.id} value={template.id}>
-                  {template.name} [{template.category}]
-                </option>
-              ))}
-            </select>
-            <button className="rl-button secondary" onClick={exportSelectedReport}>
-              Export Markdown
+              Create
             </button>
           </div>
 
-          {unresolvedPlaceholders.length > 0 ? (
-            <div className="rl-warning">Unresolved placeholders: {unresolvedPlaceholders.join(', ')}</div>
-          ) : null}
+          <label className="rl-search-wrap" htmlFor="report-search">
+            <span className="rl-meta">Search by title/content</span>
+            <input
+              id="report-search"
+              className="rl-input"
+              value={navQuery}
+              onChange={(e) => setNavQuery(e.target.value)}
+              placeholder="Find a document..."
+            />
+          </label>
 
-          <textarea
-            className="rl-textarea"
-            value={editorValue}
-            onChange={(e) => {
-              setEditorValue(e.target.value)
-              setEditorDirty(true)
-            }}
-            placeholder="Write report progress in markdown..."
-          />
-
-          <div className="rl-footer">
-            <span>Selected report: {selectedReport?.id ?? 'none'}</span>
-            <span>Autosave: {editorDirty ? 'pending' : 'synced'}</span>
-          </div>
-        </section>
-
-        <section className="rl-panel">
-          <h2 className="rl-section-title">Reports</h2>
-          <div className="rl-list">
-            {reports.map((report) => (
+          <div className="rl-list rl-doc-nav">
+            {filteredReports.map((report) => (
               <button
                 key={report.id}
                 className="rl-item"
                 data-active={report.id === selectedReportId}
-                onClick={() => setSelectedReportId(report.id)}
+                onClick={() => {
+                  setSelectedReportId(report.id)
+                  setViewMode('edit')
+                }}
               >
-                <div>{report.title}</div>
-                <div className="rl-meta">
-                  <span className="rl-badge">{report.status}</span> Updated {formatDate(report.updatedAt)}
-                </div>
+                <div className="rl-item-title">{report.title}</div>
+                <div className="rl-meta">Updated {formatDate(report.updatedAt)}</div>
+                <div className="rl-meta">{previewText(report.content, 66)}</div>
               </button>
             ))}
+            {filteredReports.length === 0 ? (
+              <div className="rl-meta">No matching documents.</div>
+            ) : null}
+          </div>
+        </aside>
+
+        <section className="rl-panel rl-workspace">
+          <div className="rl-workspace-head">
+            <div>
+              <h2 className="rl-section-title">{selectedReport?.title ?? 'Select a document'}</h2>
+              <div className="rl-meta">
+                {selectedReport ? `Updated ${formatDate(selectedReport.updatedAt)}` : 'Pick one file from the left navigation.'}
+              </div>
+            </div>
+            <div className="rl-form-row">
+              <button
+                className="rl-button secondary"
+                data-active={viewMode === 'edit'}
+                onClick={() => setViewMode('edit')}
+              >
+                Edit
+              </button>
+              <button
+                className="rl-button secondary"
+                data-active={viewMode === 'preview'}
+                onClick={() => setViewMode('preview')}
+              >
+                Browse
+              </button>
+              <button className="rl-button secondary" onClick={exportSelectedReport}>
+                Export
+              </button>
+            </div>
           </div>
 
-          <h2 className="rl-section-title" style={{ marginTop: 14 }}>
-            Import Template
-          </h2>
-          <div className="rl-form-row">
-            <input
-              className="rl-input"
-              type="file"
-              accept=".md,.txt,.json"
-              onChange={(e) => {
-                const file = e.target.files?.[0]
-                if (file) {
-                  onTemplateFileImport(file)
-                }
-                e.currentTarget.value = ''
-              }}
-            />
-          </div>
-          <div className="rl-form-row">
-            <input
-              className="rl-input"
-              value={templateName}
-              onChange={(e) => setTemplateName(e.target.value)}
-              placeholder="Template name"
-            />
-            <input
-              className="rl-input"
-              value={templateCategory}
-              onChange={(e) => setTemplateCategory(e.target.value)}
-              placeholder="Template category"
-            />
-          </div>
-          <div className="rl-form-row">
-            <textarea
-              className="rl-textarea"
-              style={{ minHeight: 120 }}
-              value={templatePaste}
-              onChange={(e) => setTemplatePaste(e.target.value)}
-              placeholder="Paste plain text template here..."
-            />
-          </div>
-          <div className="rl-form-row">
-            <button className="rl-button" onClick={importPastedTemplate}>
-              Import Pasted Template
-            </button>
-            <button
-              className="rl-button secondary"
-              onClick={() => {
-                const latest = templates[0]
-                if (latest) {
-                  createReport(latest.id)
-                }
-              }}
-            >
-              Create Report with Latest Template
-            </button>
-          </div>
+          {selectedReport?.taskChanged ? (
+            <div className="rl-warning">Task title changed in TaskBoard. Decide whether to sync report text.</div>
+          ) : null}
+
+          {conflict ? (
+            <div className="rl-warning">
+              Conflict detected for report {conflict.reportId}. Local: {formatDate(conflict.localUpdatedAt)}; External:{' '}
+              {formatDate(conflict.externalUpdatedAt)}
+              <div className="rl-form-row" style={{ marginTop: 8 }}>
+                <button className="rl-button secondary" onClick={() => commitConflictChoice('local')}>
+                  Keep Local
+                </button>
+                <button className="rl-button secondary" onClick={() => commitConflictChoice('external')}>
+                  Accept External
+                </button>
+                <button className="rl-button secondary" onClick={() => commitConflictChoice('manual')}>
+                  Manual Merge
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          {selectedReport ? (
+            <>
+              {viewMode === 'edit' ? (
+                <div className="rl-form-row">
+                  <select
+                    className="rl-select"
+                    onChange={(e) => {
+                      const nextTemplate = e.target.value
+                      setTemplateToApply(nextTemplate)
+                      if (nextTemplate) {
+                        applyTemplateToSelectedReport(nextTemplate)
+                        setTemplateToApply('')
+                      }
+                    }}
+                    value={templateToApply}
+                  >
+                    <option value="">Choose template (overwrite current content)</option>
+                    {templates.map((template) => (
+                      <option key={template.id} value={template.id}>
+                        {template.name} [{template.category}]
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : null}
+
+              {viewMode === 'edit' && templateFields.length > 0 ? (
+                <div className="rl-form-sheet" role="form" aria-label="Template form fields">
+                  {templateFields.map((field, index, arr) => {
+                    const prevSection = index > 0 ? arr[index - 1].section : null
+                    const showSection = field.section && field.section !== prevSection
+                    return (
+                      <React.Fragment key={`form-field-${field.id}`}>
+                        {showSection && <div className="rl-form-section-title">{field.section}</div>}
+                        <div className="rl-form-item">
+                          <div className="rl-form-item-head">
+                            <span className="rl-form-item-index">{String(index + 1).padStart(2, '0')}.</span>
+                            <label htmlFor={`field-${field.id}`} className="rl-form-item-label">{field.title}</label>
+                          </div>
+                          <textarea
+                            id={`field-${field.id}`}
+                            className="rl-form-item-input"
+                            value={field.value}
+                            onChange={(e) => updateTemplateField(field.id, e.target.value)}
+                            placeholder={`請填寫 ${field.title}...`}
+                          />
+                        </div>
+                      </React.Fragment>
+                    )
+                  })}
+                </div>
+              ) : null}
+
+              {unresolvedPlaceholders.length > 0 ? (
+                <div className="rl-warning">Unresolved placeholders: {unresolvedPlaceholders.join(', ')}</div>
+              ) : null}
+
+              {viewMode === 'edit' && templateFields.length === 0 ? (
+                <textarea
+                  className="rl-textarea"
+                  value={editorValue}
+                  onChange={(e) => {
+                    setEditorValue(e.target.value)
+                    setEditorDirty(true)
+                  }}
+                  placeholder="Write report progress in markdown..."
+                />
+              ) : (
+                <article className="rl-preview">{editorValue || 'No content yet.'}</article>
+              )}
+
+              <div className="rl-footer">
+                <span>Selected report: {selectedReport.id}</span>
+                <span>Autosave: {editorDirty ? 'pending' : 'synced'}</span>
+                <span>Hydrated: {hydrated ? 'yes' : 'no'} / {syncSource}</span>
+                {selectedLink ? <span>Linked: {selectedLink.reportId}</span> : null}
+              </div>
+            </>
+          ) : (
+            <div className="rl-empty-state">Create a new document or choose one from the left.</div>
+          )}
         </section>
       </div>
     </div>

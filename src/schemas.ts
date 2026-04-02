@@ -1,7 +1,7 @@
 import { z } from 'zod'
 
 export const STORAGE_KEY = 'tasks'
-export const DATA_VERSION = '1.0.0'
+export const DATA_VERSION = '1.1.0'
 export const PLUGIN_ID = 'report-logger'
 
 export const TASKBOARD_TASK_SELECTED = 'TASKBOARD_TASK_SELECTED'
