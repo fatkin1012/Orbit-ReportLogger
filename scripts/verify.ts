@@ -228,7 +228,7 @@ async function run() {
   const linkCountBeforeRestart = payloadBeforeRestart.taskReportLinks.length
   const templateCountBeforeRestart = payloadBeforeRestart.templates.length
 
-  plugin.unmount(host)
+  plugin.unmount()
 
   if (eventBus.countSubscribers() !== 0) {
     throw new Error('Unmount did not clear all event subscriptions')

@@ -30,6 +30,7 @@ export const timelineEntrySchema = z.object({
 export const reportSchema = z.object({
   id: z.string().min(1),
   taskId: z.string().nullable().optional(),
+  templateId: z.string().nullable().optional(),
   title: z.string().min(1),
   content: z.string().default(''),
   status: z.enum(['draft', 'active', 'blocked', 'closed']).default('draft'),
